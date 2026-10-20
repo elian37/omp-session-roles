@@ -1,0 +1,486 @@
+diff --git a/src/config/model-presets.ts b/src/config/model-presets.ts
+index e7efe39..bd63e83 100644
+--- a/src/config/model-presets.ts
++++ b/src/config/model-presets.ts
+@@ -151,6 +151,7 @@ const SOURCE_LABELS: Record<SettingProvenance, string> = {
+ 	project: "project config",
+ 	global: "global config",
+ 	default: "default",
++	session: "session model-role overlay",
+ };
+ 
+ /** Status line after saving `name`, naming the higher layer whose same-name preset still wins, if any. */
+diff --git a/src/config/settings.ts b/src/config/settings.ts
+index 4dbb386..02abede 100644
+--- a/src/config/settings.ts
++++ b/src/config/settings.ts
+@@ -63,7 +63,7 @@ import { cfgShellPath } from "../exec/settings";
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
+ /** Settings layer that supplies an effective value; see {@link Settings.getProvenance}. */
+-export type SettingProvenance = "env" | "runtime" | "overlay" | "project" | "global" | "default";
++export type SettingProvenance = "env" | "runtime" | "overlay" | "project" | "global" | "default" | "session";
+ 
+ /** Raw settings object as stored in YAML */
+ export interface RawSettings {
+@@ -625,6 +625,13 @@ export class Settings {
+ 	#parent: Settings | undefined;
+ 	/** Parent {@link revision} `#merged` was last built from; any other parent revision re-merges. */
+ 	#syncedParentRevision = -1;
++	/**
++	 * Session-scoped model roles ({@link setSessionModelRoles}): merged above every other layer of
++	 * this instance, read through by its {@link overlay} children, never persisted.
++	 */
++	#sessionModelRoles: Record<string, string> = {};
++	/** Set on a {@link sessionView}: writes, saves, disk reloads and re-scopes go to `#parent`. */
++	#writeThrough = false;
+ 
+ 	/**
+ 	 * Global-layer paths written during this session (for partial save), keyed by
+@@ -775,7 +782,7 @@ export class Settings {
+ 	 * @throws Error when `overrides` names an unknown setting or a value its definition rejects.
+ 	 */
+ 	overlay(overrides: Readonly<Record<string, unknown>> = {}): Settings {
+-		const child = new Settings({ inMemory: true, cwd: this.#cwd, agentDir: this.#agentDir, overrides });
++		const child = new Settings({ inMemory: true, cwd: this.getCwd(), agentDir: this.#agentDir, overrides });
+ 		child.#storage = this.#storage;
+ 		child.#parent = this;
+ 		inheritWarnings(child, this);
+@@ -813,6 +820,62 @@ export class Settings {
+ 		return child;
+ 	}
+ 
++	/**
++	 * Per-session view of this instance: reads follow this instance live plus the view's own
++	 * session model roles ({@link setSessionModelRoles}); every write, flush, disk reload and cwd
++	 * re-scope is forwarded here, so persisted settings behave exactly as on this instance.
++	 * Top-level sessions read through one so session roles never reach other sessions sharing
++	 * this instance; {@link overlay} children of the view (subagents) inherit them.
++	 */
++	sessionView(): Settings {
++		const view = this.overlay();
++		view.#writeThrough = true;
++		return view;
++	}
++
++	/** The instance a {@link sessionView} forwards writes and persistence to; `undefined` elsewhere. */
++	get #writeParent(): Settings | undefined {
++		return this.#writeThrough ? this.#parent : undefined;
++	}
++
++	/** Instance whose layers receive this instance's writes: a {@link sessionView}'s target, else itself. */
++	writeTarget(): Settings {
++		return this.#writeParent?.writeTarget() ?? this;
++	}
++
++	/**
++	 * Atomically replaces this instance's session model roles (`{}` clears them). Values use the
++	 * `modelRoles` syntax (`provider/id[:thinking]`, `@role`, comma lists). The layer outranks every
++	 * configured layer for reads of this instance and its {@link overlay} children and is never
++	 * written to any config file.
++	 *
++	 * @throws Error on the process-global instance (shared by every session).
++	 * @throws TypeError when `roles` is not a record of non-empty role names to non-empty strings.
++	 */
++	setSessionModelRoles(roles: Readonly<Record<string, string>>): void {
++		if (this === globalInstance) {
++			throw new Error("Session model roles need a per-session Settings (sessionView/overlay), not the global one");
++		}
++		if (!isRecord(roles)) throw new TypeError("Session model roles must be a record of role -> model selector");
++		const next: Record<string, string> = {};
++		for (const role of Object.keys(roles)) {
++			const value: unknown = roles[role];
++			if (!role || typeof value !== "string" || !value.trim()) {
++				throw new TypeError(`Invalid session model role ${JSON.stringify(role)}: ${JSON.stringify(value)}`);
++			}
++			setOwn(next, role, value.trim());
++		}
++		const prev = cfgModelRoles.get(this);
++		this.#sessionModelRoles = next;
++		this.#rebuildMerged();
++		this.#fireIfChanged(cfgModelRoles, prev);
++	}
++
++	/** Snapshot of this instance's own session model roles (configured layers excluded). */
++	getSessionModelRoles(): Record<string, string> {
++		return { ...this.#sessionModelRoles };
++	}
++
+ 	/** Re-merges after a parent change and forwards it unless the child's own layers pin the value. */
+ 	#applyParentChange(setting: AnySetting): void {
+ 		this.#syncParent();
+@@ -878,12 +941,14 @@ export class Settings {
+ 
+ 	/**
+ 	 * Layer supplying the effective value of `setting`, in merge precedence order:
+-	 * runtime override → config overlay → project → global → (overlay parent) → schema default.
++	 * session model roles → runtime override → config overlay → project → global → (overlay parent)
++	 * → schema default.
+ 	 * A value that merges to `null` is unset and reports `"default"`.
+ 	 */
+ 	getProvenance(setting: AnySetting): SettingProvenance {
+ 		if (!this.isConfigured(setting)) return "default";
+ 		const segments = setting.segments;
++		if (setting === cfgModelRoles && Object.keys(this.#sessionModelRoles).length > 0) return "session";
+ 		if (getByPath(this.#overrides, segments) !== undefined) return "runtime";
+ 		if (getByPath(this.#configOverlay, segments) !== undefined) return "overlay";
+ 		if (getByPath(projectLayerForMerge(this.#project), segments) !== undefined) return "project";
+@@ -900,6 +965,8 @@ export class Settings {
+ 	 * @throws Error when the value does not fit the definition's type or fails its `items`/`validate` check.
+ 	 */
+ 	writeValue(setting: AnySetting, value: unknown, layer: "global" | "override"): void {
++		const target = this.#writeParent;
++		if (target) return target.writeValue(setting, value, layer);
+ 		setting.assertWritable(value);
+ 		if (layer === "override" && setting === cfgModelRoles) {
+ 			this.#savedRuntimeModelRoleOverrides.clear();
+@@ -926,6 +993,8 @@ export class Settings {
+ 	 * the default — supply the value.
+ 	 */
+ 	unsetGlobalValue(setting: AnySetting): void {
++		const target = this.#writeParent;
++		if (target) return target.unsetGlobalValue(setting);
+ 		const current = getByPath(this.#global, setting.segments);
+ 		if (current === undefined && !this.#softPins.has(setting)) return;
+ 		const prev = setting.get(this);
+@@ -945,6 +1014,8 @@ export class Settings {
+ 	 * @throws Error when `setting` is not a record or the entry fails the definition's `validate` check.
+ 	 */
+ 	writeEntry(setting: AnySetting, key: string, value: unknown): void {
++		const target = this.#writeParent;
++		if (target) return target.writeEntry(setting, key, value);
+ 		if (setting.type !== "record") throw new Error(`Setting ${setting.id} is not a record`);
+ 		if (value !== undefined) setting.assertWritable({ [key]: value });
+ 		const record = getByPath(this.#global, setting.segments);
+@@ -974,6 +1045,8 @@ export class Settings {
+ 	 * @throws Error when `setting` is not a list or the resulting list fails its `items`/`validate` check.
+ 	 */
+ 	writeMember(setting: AnySetting, item: string, { member }: { member: boolean }): void {
++		const target = this.#writeParent;
++		if (target) return target.writeMember(setting, item, { member });
+ 		if (setting.type !== "array") throw new Error(`Setting ${setting.id} is not a list`);
+ 		const list = getByPath(this.#global, setting.segments);
+ 		const base: readonly unknown[] = Array.isArray(list) ? list : (setting.default as readonly unknown[]);
+@@ -1010,6 +1083,8 @@ export class Settings {
+ 	 * override/clear ends it.
+ 	 */
+ 	pinDefaultValue(setting: AnySetting): void {
++		const target = this.#writeParent;
++		if (target) return target.pinDefaultValue(setting);
+ 		const value = setting.default;
+ 		if (value === undefined || this.isConfigured(setting)) return;
+ 		this.writeValue(setting, value, "override");
+@@ -1035,6 +1110,8 @@ export class Settings {
+ 
+ 	/** Registry plumbing behind `Setting.clearOverride`: drops the runtime override of `setting`. */
+ 	clearOverrideValue(setting: AnySetting): void {
++		const target = this.#writeParent;
++		if (target) return target.clearOverrideValue(setting);
+ 		if (setting === cfgModelRoles) {
+ 			this.#savedRuntimeModelRoleOverrides.clear();
+ 		}
+@@ -1255,6 +1332,8 @@ export class Settings {
+ 	 * Call before exit to ensure all changes are persisted.
+ 	 */
+ 	async flush(): Promise<void> {
++		const target = this.#writeParent;
++		if (target) return target.flush();
+ 		if (this.#saveTimer) {
+ 			clearTimeout(this.#saveTimer);
+ 			this.#saveTimer = undefined;
+@@ -1287,7 +1366,9 @@ export class Settings {
+ 	async cloneForCwd(cwd: string): Promise<Settings> {
+ 		let cloned: Settings;
+ 		if (this.#parent) {
+-			cloned = (await this.#parent.cloneForCwd(cwd)).overlay();
++			// A session view's clone stays a write-through view of the parent's clone.
++			const parentClone = await this.#parent.cloneForCwd(cwd);
++			cloned = this.#writeThrough ? parentClone.sessionView() : parentClone.overlay();
+ 			cloned.#project = structuredClone(this.#project);
+ 		} else {
+ 			cloned = new Settings({
+@@ -1309,6 +1390,7 @@ export class Settings {
+ 		const layers = { ...cloned.#ownLayers(), overrides: this.#buildOriginalOverrides() };
+ 		for (const setting of cloned.#settlePins(layers)) cloned.#softPins.delete(setting);
+ 		cloned.#overrides = layers.overrides;
++		cloned.#sessionModelRoles = { ...this.#sessionModelRoles };
+ 		cloned.#rebuildMerged();
+ 		inheritWarnings(cloned, this);
+ 		cloned.#validateAll();
+@@ -1327,6 +1409,8 @@ export class Settings {
+ 	 * `validate` check; the previous layers stay in effect.
+ 	 */
+ 	async reloadFromDisk(): Promise<void> {
++		const target = this.#writeParent;
++		if (target) return target.reloadFromDisk();
+ 		if (!this.#persist) return;
+ 		await this.#exclusive("strict", () => this.#reloadPersistedLayers("strict"));
+ 	}
+@@ -1481,6 +1565,8 @@ export class Settings {
+ 	 * `validate` check; the instance then stays on its previous scope.
+ 	 */
+ 	async reloadForCwd(cwd: string): Promise<void> {
++		const target = this.#writeParent;
++		if (target) return target.reloadForCwd(cwd);
+ 		const normalized = path.normalize(cwd);
+ 		for (let active = this.#activeReload; active; active = this.#activeReload) {
+ 			await active.promise.catch(() => {});
+@@ -1535,7 +1621,7 @@ export class Settings {
+ 	}
+ 
+ 	getCwd(): string {
+-		return this.#cwd;
++		return this.#writeParent?.getCwd() ?? this.#cwd;
+ 	}
+ 
+ 	getAgentDir(): string {
+@@ -1544,7 +1630,7 @@ export class Settings {
+ 
+ 	/** Resolved absolute paths of the config overlays supplied to this instance. */
+ 	getConfigFiles(): readonly string[] {
+-		return [...this.#configFiles];
++		return this.#writeParent?.getConfigFiles() ?? [...this.#configFiles];
+ 	}
+ 
+ 	/**
+@@ -1740,6 +1826,8 @@ export class Settings {
+ 	 * stale skip in place.
+ 	 */
+ 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
++		const target = this.#writeParent;
++		if (target) return target.setModelRole(role, modelId);
+ 		const prev = cfgModelRoles.get(this);
+ 		// Re-setting the persisted role (or clearing an absent one) stages no config.yml rewrite;
+ 		// the runtime-override sync below still applies.
+@@ -1777,6 +1865,8 @@ export class Settings {
+ 	 * surviving capture implies no external supersession occurred.
+ 	 */
+ 	isProjectModelRoleRuntimeOverrideActive(role: ModelRole | string): boolean {
++		const target = this.#writeParent;
++		if (target) return target.isProjectModelRoleRuntimeOverrideActive(role);
+ 		if (cfgModelRoleStorage.get(this) !== "project") return false;
+ 		if (!this.#savedRuntimeModelRoleOverrides.has(role)) return false;
+ 		return !!this.getProjectModelRole(role);
+@@ -1785,6 +1875,8 @@ export class Settings {
+ 	 * Set a model role in the current project's settings layer.
+ 	 */
+ 	setProjectModelRole(role: ModelRole | string, modelId: string): void {
++		const target = this.#writeParent;
++		if (target) return target.setProjectModelRole(role, modelId);
+ 		this.#setProjectModelRoleValue(role, modelId);
+ 		this.#captureRuntimeModelRoleOverride(role);
+ 		this.#updateRuntimeModelRoleOverride(role, modelId);
+@@ -1793,6 +1885,8 @@ export class Settings {
+ 	 * Clear a model role from the current project's settings layer.
+ 	 */
+ 	clearProjectModelRole(role: ModelRole | string): void {
++		const target = this.#writeParent;
++		if (target) return target.clearProjectModelRole(role);
+ 		this.#setProjectModelRoleValue(role, null);
+ 		this.#captureRuntimeModelRoleOverride(role);
+ 		this.#updateRuntimeModelRoleOverride(role, undefined);
+@@ -1824,8 +1918,8 @@ export class Settings {
+ 
+ 	/**
+ 	 * Report which layer actually supplies the effective model role across
+-	 * full merge precedence (runtime override → config overlay → project →
+-	 * global → default). Unlike {@link getModelRoleSource}, this accounts
++	 * full merge precedence (session model roles → runtime override → config
++	 * overlay → project → global → default). Unlike {@link getModelRoleSource}, this accounts
+ 	 * for runtime and config-overlay layers and detects ownership by key
+ 	 * presence rather than normalized value, so a `null` tombstone in the
+ 	 * overlay or runtime layer correctly blocks lower layers. The project
+@@ -1834,6 +1928,7 @@ export class Settings {
+ 	 * tombstone.
+ 	 */
+ 	getModelRoleProvenance(role: ModelRole | string): SettingProvenance {
++		if (Object.hasOwn(this.#sessionModelRoles, role)) return "session";
+ 		if (this.#modelRoleLayerOwns(this.#overrides, role)) return "runtime";
+ 		if (this.#modelRoleLayerOwns(this.#configOverlay, role)) return "overlay";
+ 		if (this.#modelRoleLayerOwns(projectLayerForMerge(this.#project), role)) return "project";
+@@ -1902,6 +1997,8 @@ export class Settings {
+ 	 * Override model roles (helper for modelRoles record).
+ 	 */
+ 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
++		const target = this.#writeParent;
++		if (target) return target.overrideModelRoles(roles);
+ 		const next = this.#modelRolesFromLayer(this.#overrides);
+ 		for (const [role, modelId] of Object.entries(roles)) {
+ 			if (modelId) {
+@@ -3896,7 +3993,13 @@ export class Settings {
+ 	#rebuildMerged(): void {
+ 		this.#revision++;
+ 		if (this.#parent) this.#syncedParentRevision = this.#parent.revision;
+-		this.#merged = this.#mergeOverParent(this.#mergeOwnLayers(this.#ownLayers()));
++		// A session view follows its target across cwd re-scopes (path-scoped values resolve there).
++		if (this.#writeThrough && this.#parent) this.#cwd = this.#parent.#cwd;
++		const merged = this.#mergeOverParent(this.#mergeOwnLayers(this.#ownLayers()));
++		this.#merged =
++			Object.keys(this.#sessionModelRoles).length > 0
++				? this.#deepMerge(merged, { modelRoles: this.#sessionModelRoles })
++				: merged;
+ 	}
+ 
+ 	#ownLayers(): OwnLayers {
+diff --git a/src/extensibility/extensions/loader.ts b/src/extensibility/extensions/loader.ts
+index e277e6d..fbc3b0e 100644
+--- a/src/extensibility/extensions/loader.ts
++++ b/src/extensibility/extensions/loader.ts
+@@ -162,6 +162,14 @@ export class ExtensionRuntime implements IExtensionRuntime {
+ 		throw new ExtensionRuntimeNotInitializedError();
+ 	}
+ 
++	setSessionModelRoles(): void {
++		throw new ExtensionRuntimeNotInitializedError();
++	}
++
++	getSessionModelRoles(): Record<string, string> {
++		throw new ExtensionRuntimeNotInitializedError();
++	}
++
+ 	getSessionName(): string | undefined {
+ 		throw new ExtensionRuntimeNotInitializedError();
+ 	}
+@@ -340,6 +348,14 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+ 		this.runtime.setThinkingLevel(level, persist);
+ 	}
+ 
++	setSessionModelRoles(roles: Readonly<Record<string, string>>): void {
++		this.runtime.setSessionModelRoles(roles);
++	}
++
++	getSessionModelRoles(): Record<string, string> {
++		return this.runtime.getSessionModelRoles();
++	}
++
+ 	getServiceTiers(): Readonly<ServiceTierByFamily> {
+ 		return { ...this.runtime.getServiceTiers() };
+ 	}
+diff --git a/src/extensibility/extensions/runner.ts b/src/extensibility/extensions/runner.ts
+index a21f6f9..8eb9299 100644
+--- a/src/extensibility/extensions/runner.ts
++++ b/src/extensibility/extensions/runner.ts
+@@ -795,6 +795,11 @@ export class ExtensionRunner {
+ 		return this.settings;
+ 	}
+ 
++	#requireSessionSettings(): Settings {
++		if (!this.settings) throw new Error("Session model roles need a session; this extension runner has none");
++		return this.settings;
++	}
++
+ 	initialize(
+ 		actions: ExtensionActions,
+ 		contextActions: ExtensionContextActions,
+@@ -819,6 +824,10 @@ export class ExtensionRunner {
+ 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+ 		this.runtime.getServiceTiers = actions.getServiceTiers ?? throwUnsupportedServiceTierAction;
+ 		this.runtime.setServiceTier = actions.setServiceTier ?? throwUnsupportedServiceTierAction;
++		// Bound here rather than per host (TUI, print, RPC, ACP, subagents): every mode reaches
++		// the same session settings the runner was constructed with.
++		this.runtime.setSessionModelRoles = roles => this.#requireSessionSettings().setSessionModelRoles(roles);
++		this.runtime.getSessionModelRoles = () => this.#requireSessionSettings().getSessionModelRoles();
+ 		this.runtime.getSessionName = actions.getSessionName;
+ 		this.runtime.setSessionName = actions.setSessionName;
+ 		this.runtime.registerProvider = (name, config, sourceId) => {
+diff --git a/src/extensibility/extensions/types.ts b/src/extensibility/extensions/types.ts
+index 6e2d043..0f8d385 100644
+--- a/src/extensibility/extensions/types.ts
++++ b/src/extensibility/extensions/types.ts
+@@ -1895,6 +1895,17 @@ export interface ExtensionAPI {
+ 	/** Set thinking level for the current session. */
+ 	setThinkingLevel(level: ThinkingLevel): void;
+ 
++	/**
++	 * Atomically replace this session's model-role overlay (`{}` clears it). Values use the
++	 * `modelRoles` syntax (`provider/id[:thinking]`, or a comma-separated list). The overlay outranks
++	 * every configured layer for this session and the subagents it spawns afterwards; other
++	 * sessions never see it, and it is never written to any config file.
++	 */
++	setSessionModelRoles(roles: Readonly<Record<string, string>>): void;
++
++	/** Snapshot of this session's model-role overlay (configured layers excluded). */
++	getSessionModelRoles(): Record<string, string>;
++
+ 	/** Get a snapshot of the current session's per-family service tiers. */
+ 	getServiceTiers(): Readonly<ServiceTierByFamily>;
+ 
+@@ -2197,6 +2208,9 @@ export interface ExtensionCommandContextActions {
+ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+ 	getServiceTiers: GetServiceTiersHandler;
+ 	setServiceTier: SetServiceTierHandler;
++	/** Bound by the runner to its session's settings (see `ExtensionAPI.setSessionModelRoles`). */
++	setSessionModelRoles: (roles: Readonly<Record<string, string>>) => void;
++	getSessionModelRoles: () => Record<string, string>;
+ }
+ 
+ /** Loaded extension with all registered items. */
+diff --git a/src/internal-urls/cfg-protocol.ts b/src/internal-urls/cfg-protocol.ts
+index 0da87d3..19a3e80 100644
+--- a/src/internal-urls/cfg-protocol.ts
++++ b/src/internal-urls/cfg-protocol.ts
+@@ -70,6 +70,7 @@ const PROVENANCE_LABELS: Record<SettingProvenance, string> = {
+ 	project: "project config",
+ 	global: "global config",
+ 	default: "default",
++	session: "session model-role overlay",
+ };
+ 
+ /** A settings change awaiting the user's decision. Values are display-formatted, credentials redacted. */
+@@ -421,7 +422,8 @@ export class CfgProtocolHandler implements ProtocolHandler {
+ 			// A session sharing the persistent instance drops its own override on save, so it does not shadow.
+ 			const persistent = host.persistentSettings;
+ 			const above = ABOVE_GLOBAL.filter(
+-				layer => !(layer === "env" && leaf.envFallback) && !(layer === "runtime" && settings === persistent),
++				layer =>
++					!(layer === "env" && leaf.envFallback) && !(layer === "runtime" && settings.writeTarget() === persistent),
+ 			);
+ 			const layer = saveShadowingLayer(leaf, persistent, value, above);
+ 			if (layer) {
+@@ -443,8 +445,9 @@ export class CfgProtocolHandler implements ProtocolHandler {
+ 		if (!save) {
+ 			leaf.override(settings, value);
+ 			host.applied({ path: leaf.id, value: leaf.get(settings), settings, save });
+-			// A non-fallback env var outranks runtime overrides; report it instead of claiming the change.
+-			const layer = shadowingLayer(leaf, settings, value, ABOVE_SESSION);
++			// A non-fallback env var (or this session's model-role overlay) outranks runtime overrides;
++			// report it instead of claiming the change.
++			const layer = shadowingLayer(leaf, settings, value, [...ABOVE_SESSION, "session"]);
+ 			return finish("applied", layer ? { layer, scope: settings } : undefined);
+ 		}
+ 		const persistent = host.persistentSettings;
+@@ -452,7 +455,7 @@ export class CfgProtocolHandler implements ProtocolHandler {
+ 		await persistent.flush();
+ 		// A session sharing the persistent instance drops its override so the saved value
+ 		// takes effect; a separate instance never reloads from disk, so mirror it.
+-		if (settings === persistent) {
++		if (settings.writeTarget() === persistent) {
+ 			leaf.clearOverride(settings);
+ 		} else {
+ 			leaf.override(settings, value);
+diff --git a/src/sdk.ts b/src/sdk.ts
+index fb8c682..fc6e875 100644
+--- a/src/sdk.ts
++++ b/src/sdk.ts
+@@ -1752,14 +1752,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
+ 	registerSshCleanup();
+ 	registerEvalCleanup();
+ 
+-	const settings = await (options.settings ??
++	const sharedSettings = await (options.settings ??
+ 		options.settingsManager ??
+ 		logger.time("settings", Settings.init, { cwd, agentDir }));
++	// Top-level sessions read through a write-through view of the (possibly process-global)
++	// instance: session model roles (`setSessionModelRoles`) stay with this session and the
++	// subagents it spawns (their settings overlay this view), while every write still persists.
++	const isTopLevelSession = !options.parentTaskPrefix && !options.taskDepth;
++	const settings = isTopLevelSession ? sharedSettings.sessionView() : sharedSettings;
+ 	// Discovery provider toggles and process-wide setting effects (theme, request limits, …)
+ 	// follow the newest holder: each top-level session holds both on its settings until disposed,
+ 	// then hands them back to the previous holder. Subagents and helper sessions never take them,
+ 	// so a parent's live edits keep reaching discovery and effects.
+-	const bindsProcessState = options.bindProcessState !== false && !options.parentTaskPrefix && !options.taskDepth;
++	const bindsProcessState = options.bindProcessState !== false && isTopLevelSession;
+ 	const restoreProviderToggles = bindsProcessState
+ 		? logger.time("initializeWithSettings", initializeWithSettings, settings)
+ 		: undefined;
