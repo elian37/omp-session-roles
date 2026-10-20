@@ -1,6 +1,6 @@
 # omp-session-roles
 
-> Session-scoped model role overrides for [Oh My Pi (omp)](https://github.com/can1357/oh-my-pi): pick a model and thinking level per role (`task`, `plan`, `slow`, `advisor`, `default`, custom roles) inside one running conversation via `/roles`. Never writes config files; new subagents use the override immediately; other sessions are unaffected. Docs below are in Chinese.
+**中文** | [English](README.en.md)
 
 Oh My Pi（omp）扩展：**当前会话独立的模型角色配置**。在正在运行的对话里用 `/roles` 给 `task`、`plan`、`slow`、`advisor`、`default` 以及自定义角色指定模型和 Thinking Level：
 
